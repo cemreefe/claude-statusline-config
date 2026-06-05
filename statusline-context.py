@@ -20,9 +20,10 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-STATUS_TTL = 120  # seconds before re-fetching PR status
+STATUS_TTL = 120  # default seconds before re-fetching PR status; override in config
 
 _COLORS: dict[str, tuple[int, int, int]] = {
     "passing":             (70, 210, 110),  # green
@@ -73,11 +74,11 @@ def load_config() -> dict:
         return {}
 
 
-_CONFIG: dict = {}  # populated in main()
+_CONFIG: dict = {}          # populated in main()
+_TICKET_PATTERNS: list = [] # compiled once in main() after config is loaded
 
 
-def _compiled_ticket_patterns() -> list[tuple[re.Pattern, str]]:
-    """Return list of (compiled_pattern, url_template) from config."""
+def _compile_ticket_patterns() -> list[tuple[re.Pattern, str]]:
     result = []
     for entry in _CONFIG.get("ticket_patterns", []):
         pat = entry.get("pattern", "")
@@ -94,7 +95,7 @@ def _compiled_ticket_patterns() -> list[tuple[re.Pattern, str]]:
 def extract_tickets(text: str) -> list[str]:
     """Return deduplicated ticket IDs found in text, across all configured patterns."""
     seen: dict[str, None] = {}
-    for compiled, _ in _compiled_ticket_patterns():
+    for compiled, _ in _TICKET_PATTERNS:
         for m in compiled.finditer(text):
             seen[m.group(1)] = None
     return list(seen)
@@ -102,7 +103,7 @@ def extract_tickets(text: str) -> list[str]:
 
 def ticket_url(tid: str) -> str:
     """Return the URL for a ticket ID, or empty string if no matching pattern has a url_template."""
-    for compiled, url_tpl in _compiled_ticket_patterns():
+    for compiled, url_tpl in _TICKET_PATTERNS:
         if compiled.search(tid) and url_tpl:
             return url_tpl.replace("{ticket}", tid)
     return ""
@@ -110,7 +111,7 @@ def ticket_url(tid: str) -> str:
 
 def strip_tickets(text: str) -> str:
     """Remove all configured ticket references including surrounding brackets/parens."""
-    for compiled, _ in _compiled_ticket_patterns():
+    for compiled, _ in _TICKET_PATTERNS:
         text = re.sub(r'[\(\[]\s*' + compiled.pattern.strip(r'\b()') + r'\s*[\)\]]', '', text)
         text = compiled.sub('', text)
     return re.sub(r'\s{2,}', ' ', text).strip(' -\u2013()[]')
@@ -247,8 +248,9 @@ def get_open_prs(branch: str) -> list:
 
 
 def main() -> None:
-    global _CONFIG
+    global _CONFIG, _TICKET_PATTERNS
     _CONFIG = load_config()
+    _TICKET_PATTERNS = _compile_ticket_patterns()
 
     ctx_file = sys.argv[1] if len(sys.argv) > 1 else ""
     seed = sys.argv[2] if len(sys.argv) > 2 else str(os.getppid())
@@ -305,23 +307,29 @@ def main() -> None:
 
     prs_to_render = manual_prs if manual_prs else auto_prs
     now = time.time()
+    ttl = _CONFIG.get("status_ttl", STATUS_TTL)
     ctx_dirty = False
+
+    # Fetch stale statuses in parallel
+    stale = [p for p in prs_to_render if now - p.get("status_at", 0) > ttl]
+    if stale:
+        with ThreadPoolExecutor(max_workers=len(stale)) as ex:
+            futures = {ex.submit(fetch_pr_status, p["number"], p.get("repo", "")): p for p in stale}
+            for future in as_completed(futures):
+                p = futures[future]
+                try:
+                    status = future.result()
+                except Exception:
+                    status = {"ci": "unknown", "review": "unknown"}
+                p["ci"] = status["ci"]
+                p["review"] = status["review"]
+                p["status_at"] = now
+                ctx_dirty = True
 
     for p in prs_to_render:
         repo = p.get("repo", "")
         number = p["number"]
-        title = strip_title(p.get("title", f"#{number}"))
         url = p.get("url") or f"https://github.com/{repo}/pull/{number}"
-
-        # Refresh status if stale
-        status_at = p.get("status_at", 0)
-        if now - status_at > STATUS_TTL:
-            status = fetch_pr_status(number, repo)
-            p["ci"] = status["ci"]
-            p["review"] = status["review"]
-            p["status_at"] = now
-            ctx_dirty = True
-
         ci_color = CI_COLORS.get(p.get("ci", "unknown"), CI_COLORS["unknown"])
         review_color = REVIEW_COLORS.get(p.get("review", "unknown"), REVIEW_COLORS["unknown"])
         num_str = gradient_text(f"#{number}", ci_color, review_color)
