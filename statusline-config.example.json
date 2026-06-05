@@ -1,0 +1,11 @@
+{
+  "strip_patterns": [
+    "^[a-z]+(\\([^)]*\\))?!?:\\s*"
+  ],
+  "ticket_patterns": [
+    {
+      "pattern": "[A-Z][A-Z0-9]+-\\d+",
+      "url_template": "https://your-org.atlassian.net/browse/{ticket}"
+    }
+  ]
+}
